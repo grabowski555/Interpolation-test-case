@@ -1,0 +1,269 @@
+#%%
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import CubicSpline
+
+plt.rcParams["axes.unicode_minus"] = False
+plt.rcParams.update({
+    "font.family": "Bell MT",    # Font name
+    "font.size":10,             # Global font size in points
+    "axes.titlesize": 18,        # Title size
+    "axes.labelsize": 18,        # X/Y label size
+    "xtick.labelsize": 13,       # Tick label size
+    "ytick.labelsize": 13,
+    "legend.fontsize": 10,       # Legend text size
+    "figure.titlesize": 20,      # Suptitle (top-level title)
+})
+
+#constants
+A = np.float64(1.0)          # amplitude in Ey = A * sin(x)
+q_over_m = np.float64(1.0)   # q/m
+v0 = np.float64(1.0)         # initial vx
+x0 = np.float64(0.0)
+y0 = np.float64(0.0)
+
+vy0 = - (q_over_m * A / v0) * np.cos(x0)
+vy0 = np.float64(vy0)
+
+#time
+T  = 4*np.pi
+Nt = 4000
+t  = np.linspace(0.0, T, Nt, dtype=np.float64)
+dt = np.float64(t[1] - t[0])
+
+#domain
+Lx_min, Lx_max = -2*np.pi, 2*np.pi
+Ly_min, Ly_max = 0.0, 2*np.pi
+Lx = np.float64(Lx_max - Lx_min)
+Ly = np.float64(Ly_max - Ly_min)
+
+#grid
+Nx, Ny = 64, 64
+xg = np.linspace(Lx_min, Lx_max, Nx, endpoint=False, dtype=np.float64)
+yg = np.linspace(Ly_min, Ly_max, Ny, endpoint=False, dtype=np.float64)
+dx = np.float64(Lx / Nx)
+dy = np.float64(Ly / Ny)
+
+def wrap(z, zmin, L):
+    return (z - zmin) % L + zmin
+
+def Ey_exact(x):
+    return A * np.sin(x, dtype=np.float64)
+
+Ey_grid_clean = Ey_exact(xg)[:, None] * np.ones((1, Ny), dtype=np.float64)
+
+noise_on   = False
+noise_amp  = np.float64(.1)   # amplitude
+noise_mode = "absolute"         # "absolute" or "relative"
+rng        = np.random.default_rng(42)
+
+def sample_noise(scale=np.float64(1.0)):
+    return scale * (np.float64(2.0)*rng.random() - np.float64(1.0))
+
+def add_noise_to_grid(E_grid):
+    noisy = E_grid.copy()
+    for i in range(Nx):
+        for j in range(Ny):
+            if noise_mode == "absolute":
+                noisy[i, j] += sample_noise(noise_amp)
+            elif noise_mode == "relative":
+                noisy[i, j] += sample_noise(noise_amp * (np.abs(E_grid[i, j]) + 1.0e-12))
+            else:
+                raise ValueError("noise_mode must be 'absolute' or 'relative'")
+    return noisy
+
+Ey_grid = add_noise_to_grid(Ey_grid_clean) if noise_on else Ey_grid_clean.copy()
+
+def ey_nn(x, y):
+    xr = wrap(x, Lx_min, Lx); yr = wrap(y, Ly_min, Ly)
+    ix = np.rint((xr - Lx_min)/dx).astype(np.int64) % Nx
+    iy = np.rint((yr - Ly_min)/dy).astype(np.int64) % Ny
+    return Ey_grid[ix, iy]
+
+def ey_bilinear(x, y):
+    xr = wrap(x, Lx_min, Lx); yr = wrap(y, Ly_min, Ly)
+    fx = (xr - Lx_min)/dx;     fy = (yr - Ly_min)/dy
+    i0 = np.floor(fx).astype(np.int64) % Nx
+    j0 = np.floor(fy).astype(np.int64) % Ny
+    i1 = (i0 + 1) % Nx;        j1 = (j0 + 1) % Ny
+    ax = (fx - np.floor(fx)).astype(np.float64)
+    ay = (fy - np.floor(fy)).astype(np.float64)
+    w00 = (1.0 - ax)*(1.0 - ay); w10 = ax*(1.0 - ay)
+    w01 = (1.0 - ax)*ay;         w11 = ax*ay
+    return (w00*Ey_grid[i0, j0] + w10*Ey_grid[i1, j0] +
+            w01*Ey_grid[i0, j1] + w11*Ey_grid[i1, j1])
+
+def cubic_kernel(r, a=-0.5):
+    r = np.abs(r)
+    out = np.zeros_like(r, dtype=np.float64)
+    m1 = (r < 1.0); m2 = (r >= 1.0) & (r < 2.0)
+    out[m1] = ((a + 2.0)*r[m1] - (a + 3.0)) * r[m1]*r[m1] + 1.0
+    out[m2] = ((a*r[m2] - 5.0*a)*r[m2] + 8.0*a)*r[m2] - 4.0*a
+    return out
+
+def ey_bicubic_kernel(x, y, a=-0.5):
+    xr = wrap(x, Lx_min, Lx); yr = wrap(y, Ly_min, Ly)
+    fx = (xr - Lx_min)/dx;     fy = (yr - Ly_min)/dy
+    i0 = np.floor(fx).astype(np.int64); j0 = np.floor(fy).astype(np.int64)
+    ixm1 = (i0 - 1) % Nx; ix0 = i0 % Nx; ix1 = (i0 + 1) % Nx; ix2 = (i0 + 2) % Nx
+    jym1 = (j0 - 1) % Ny; jy0 = j0 % Ny; jy1 = (j0 + 1) % Ny; jy2 = (j0 + 2) % Ny
+    u = (fx - np.floor(fx)).astype(np.float64); v = (fy - np.floor(fy)).astype(np.float64)
+
+    wx = np.stack([cubic_kernel(u + 1.0, a),
+                   cubic_kernel(u + 0.0, a),
+                   cubic_kernel(1.0 - u, a),
+                   cubic_kernel(2.0 - u, a)], axis=0)
+    wy = np.stack([cubic_kernel(v + 1.0, a),
+                   cubic_kernel(v + 0.0, a),
+                   cubic_kernel(1.0 - v, a),
+                   cubic_kernel(2.0 - v, a)], axis=0)
+    S_m1 = wx[0]*Ey_grid[ixm1, jym1] + wx[1]*Ey_grid[ix0, jym1] + wx[2]*Ey_grid[ix1, jym1] + wx[3]*Ey_grid[ix2, jym1]
+    S_0  = wx[0]*Ey_grid[ixm1, jy0 ] + wx[1]*Ey_grid[ix0, jy0 ] + wx[2]*Ey_grid[ix1, jy0 ] + wx[3]*Ey_grid[ix2, jy0 ]
+    S_1  = wx[0]*Ey_grid[ixm1, jy1 ] + wx[1]*Ey_grid[ix0, jy1 ] + wx[2]*Ey_grid[ix1, jy1 ] + wx[3]*Ey_grid[ix2, jy1 ]
+    S_2  = wx[0]*Ey_grid[ixm1, jy2 ] + wx[1]*Ey_grid[ix0, jy2 ] + wx[2]*Ey_grid[ix1, jy2 ] + wx[3]*Ey_grid[ix2, jy2 ]
+    return (wy[0]*S_m1 + wy[1]*S_0 + wy[2]*S_1 + wy[3]*S_2)
+
+
+xg_spline = np.linspace(Lx_min, Lx_max, Nx + 1, endpoint=True, dtype=np.float64)
+Ey_samples_noisy = np.append(Ey_grid[:, 0], Ey_grid[0, 0])  
+Ey_samples_noisy[-1] = Ey_samples_noisy[0]                  
+cs_Ey_noisy = CubicSpline(xg_spline, Ey_samples_noisy, bc_type='periodic')
+
+def ey_cubic_periodic_noisy(x, y):
+    xr = wrap(x, Lx_min, Lx)
+    return np.float64(cs_Ey_noisy(xr))
+
+def Ey_at(x, y, scheme="nn"):
+    if scheme == "nn":               return ey_nn(x, y)
+    if scheme == "bilinear":         return ey_bilinear(x, y)
+    if scheme == "bicubic":          return ey_bicubic_kernel(x, y)
+    if scheme == "cubic_periodic":   return ey_cubic_periodic_noisy(x, y)  
+    raise ValueError("scheme must be 'nn','bilinear','bicubic','cubic_periodic'")
+
+Bz_const = np.float64(0.0)
+
+def boris_step_core(x, y, vxh, vyh, dt, Ex, Ey):
+    
+    vxm = vxh + 0.5*dt*q_over_m*Ex
+    vym = vyh + 0.5*dt*q_over_m*Ey
+
+    tB = 0.5*dt*q_over_m*Bz_const
+    t2 = tB*tB
+    s  = 2.0*tB/(1.0 + t2)
+    vpx = vxm - vym*tB
+    vpy = vym + vxm*tB
+    vxp = vxm - vpy*s
+    vyp = vym + vpx*s
+
+    vxh_new = vxp + 0.5*dt*q_over_m*Ex
+    vyh_new = vyp + 0.5*dt*q_over_m*Ey
+
+    x_new = wrap(x + vxh_new*dt, Lx_min, Lx)
+    y_new = y + vyh_new*dt
+    return x_new, y_new, vxh_new, vyh_new
+
+def run_boris_staggered(scheme, use_exact_E=False):
+    x = np.float64(x0)
+    y = np.float64(y0)
+
+    Ey0_prime = Ey_exact(x0)
+    Ex0 = np.float64(0.0)
+    vxh = np.float64(v0)
+    vyh = np.float64(vy0) + 0.5*dt*q_over_m*Ey0_prime
+
+    xs = np.empty(Nt, dtype=np.float64)
+    ys = np.empty(Nt, dtype=np.float64)
+    Ey_series = np.empty(Nt, dtype=np.float64)
+    vxh_series = np.empty(Nt, dtype=np.float64)
+    vyh_series = np.empty(Nt, dtype=np.float64)
+
+    for n in range(Nt):
+        xs[n] = x; ys[n] = y
+        vxh_series[n] = vxh; vyh_series[n] = vyh
+
+        if use_exact_E:
+            Ey_val = Ey_exact(x)
+        else:
+            Ey_val = Ey_at(x, y, scheme)
+
+        Ey_series[n] = Ey_val
+
+        if n < Nt-1:
+            x, y, vxh, vyh = boris_step_core(x, y, vxh, vyh, dt, Ex0, Ey_val)
+
+    return xs, ys, Ey_series, vxh_series, vyh_series
+
+# Reference
+x_ex, y_ex, Ey_ex, vxh_ex, vyh_ex = run_boris_staggered("bilinear", use_exact_E=True)
+
+x_nn, y_nn, Ey_nn, vxh_nn, vyh_nn = run_boris_staggered("nn",             use_exact_E=False)
+x_li, y_li, Ey_li, vxh_li, vyh_li = run_boris_staggered("bilinear",       use_exact_E=False)
+x_cu, y_cu, Ey_cu, vxh_cu, vyh_cu = run_boris_staggered("bicubic",        use_exact_E=False)
+x_cp, y_cp, Ey_cp, vxh_cp, vyh_cp = run_boris_staggered("cubic_periodic", use_exact_E=False)
+
+def align(y): return y - y[0]
+y_ex_plot = align(y_ex)
+y_nn_plot = align(y_nn)
+y_li_plot = align(y_li)
+y_cu_plot = align(y_cu)
+y_cp_plot = align(y_cp)
+
+def KE_from_halfstep(vxh, vyh, m=np.float64(1.0)):
+    return 0.5*m*(vxh*vxh + vyh*vyh)
+
+KE_ex = KE_from_halfstep(vxh_ex, vyh_ex)
+KE_nn = KE_from_halfstep(vxh_nn, vyh_nn)
+KE_li = KE_from_halfstep(vxh_li, vyh_li)
+KE_cu = KE_from_halfstep(vxh_cu, vyh_cu)
+KE_cp = KE_from_halfstep(vxh_cp, vyh_cp)
+
+rmse = lambda a, b: np.sqrt(np.mean((a - b)**2, dtype=np.float64))
+print("Noise:", "ON" if noise_on else "OFF", "| mode:", noise_mode, "| amp:", float(noise_amp))
+print("RMSE Ey (NN vs exactE)        = %.6e" % rmse(Ey_nn, Ey_ex))
+print("RMSE Ey (bilin vs exactE)     = %.6e" % rmse(Ey_li, Ey_ex))
+print("RMSE Ey (bicub vs exactE)     = %.6e" % rmse(Ey_cu, Ey_ex))
+print("RMSE Ey (cubic_per vs exactE) = %.6e" % rmse(Ey_cp, Ey_ex))
+print("RMSE y  (NN vs exactE)        = %.6e" % rmse(y_nn_plot, y_ex_plot))
+print("RMSE y  (bilin vs exactE)     = %.6e" % rmse(y_li_plot, y_ex_plot))
+print("RMSE y  (bicub vs exactE)     = %.6e" % rmse(y_cu_plot, y_ex_plot))
+print("RMSE y  (cubic_per vs exactE) = %.6e" % rmse(y_cp_plot, y_ex_plot))
+print("RMSE KE (NN vs exactE)        = %.6e" % rmse(KE_nn, KE_ex))
+print("RMSE KE (bilin vs exactE)     = %.6e" % rmse(KE_li, KE_ex))
+print("RMSE KE (bicub vs exactE)     = %.6e" % rmse(KE_cu, KE_ex))
+print("RMSE KE (cubic_per vs exactE) = %.6e" % rmse(KE_cp, KE_ex))
+
+# y(t)
+plt.figure(figsize=(9,4.2))
+plt.plot(t, y_ex_plot, lw=2, label="reference y(t) (Boris+ Ey)")
+plt.plot(t, y_nn_plot, lw=1.1, ls="--", label="NN")
+plt.plot(t, y_li_plot, lw=1.1, ls="-.", label="bilinear")
+plt.plot(t, y_cu_plot, lw=1.1, ls=":",  label="bicubic kernel")
+plt.plot(t, y_cp_plot, lw=1.1, ls=(0,(5,2)), label="cubic periodic ")
+plt.title("Transverse motion: reference vs interpolants ")
+plt.xlabel("t"); plt.ylabel("y(t)")
+plt.legend(); plt.grid(True, alpha=0.3); plt.tight_layout()
+
+# Ey along the path
+plt.figure(figsize=(9,4.2))
+plt.plot(t, Ey_ex, lw=2, label="Ey (reference)")
+plt.plot(t, Ey_nn, lw=1.1, ls="--",          label="NN")
+plt.plot(t, Ey_li, lw=1.1, ls="-.",          label="bilinear")
+plt.plot(t, Ey_cu, lw=1.1, ls=":",           label="bicubic kernel")
+plt.plot(t, Ey_cp, lw=1.1, ls=(0,(5,2)),     label="cubic periodic ")
+plt.title("Field seen along the path ")
+plt.xlabel("t"); plt.ylabel("Ey")
+plt.legend(); plt.grid(True, alpha=0.3); plt.tight_layout()
+
+# Kinetic energy vs time
+plt.figure(figsize=(9,4.2))
+plt.plot(t, KE_ex, lw=2, label="KE (reference)")
+plt.plot(t, KE_nn, lw=1.1, ls="--",          label="NN")
+plt.plot(t, KE_li, lw=1.1, ls="-.",          label="bilinear")
+plt.plot(t, KE_cu, lw=1.1, ls=":",           label="bicubic kernel")
+plt.plot(t, KE_cp, lw=1.1, ls=(0,(5,2)),     label="cubic periodic ")
+plt.title("Kinetic energy vs time")
+plt.xlabel("t"); plt.ylabel("K(t) = 0.5 (vx^2 + vy^2)")
+plt.legend(); plt.grid(True, alpha=0.3); plt.tight_layout()
+
+plt.show()
+#%%
